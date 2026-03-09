@@ -5,4 +5,4 @@ nixPkgs = ["ffmpeg", "nodejs_20"]
 cmds = ["npm install"]
 
 [start]
-cmd = "node server.js"
+cmd = "bash start.sh"
