@@ -1,0 +1,30 @@
+# Credentials and local environment configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+client_secret*.json
+service-account*.json
+token*.json
+cookies*.txt
+*.db
+*.sqlite*
+
+# Dependencies, runtime data, logs, downloads, and editor files
+node_modules/
+data/
+tmp/
+temp/
+downloads/
+*.log
+*.mp4
+*.webm
+coverage/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

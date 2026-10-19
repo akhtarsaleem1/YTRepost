@@ -4,7 +4,7 @@ require('dotenv').config();
 const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs-extra');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID: uuidv4 } = require('node:crypto');
 
 const TEMP_DIR = process.env.PROCESSING_TEMP_DIR || '/tmp/yt-reposter';
 

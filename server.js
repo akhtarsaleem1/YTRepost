@@ -7,23 +7,25 @@ const { google } = require('googleapis');
 const ffmpeg    = require('fluent-ffmpeg');
 const fs        = require('fs-extra');
 const path      = require('path');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID: uuidv4 } = require('node:crypto');
+const { loadConfig } = require('./config');
+const { escapeHtml, securityHeaders, requireAdmin, requireSameOrigin, createOAuthState } = require('./security');
+const config = loadConfig();
 
 // ═══════════════════════════════════════════════════════════════════════
 //  CONFIG
 // ═══════════════════════════════════════════════════════════════════════
-const PORT         = process.env.PORT || 3000;
-const SOURCE_CH    = process.env.SOURCE_CHANNEL_ID  || 'UCZkLRWVabarmwiTvAneP_eQ';
-const TARGET_CH    = process.env.TARGET_CHANNEL_ID  || 'UC2HKQFf-HDw8UGGlIyW95kA';
-const API_KEY      = process.env.YOUTUBE_API_KEY    || 'AIzaSyBdRJHIlCcCn0LdB-UxHH3L-0VKwjVIg4c';
-const CLIENT_ID    = process.env.YOUTUBE_CLIENT_ID  || '673629947182-tk52p16svivqt3k1525kmmdhb2co13cl.apps.googleusercontent.com';
-const CLIENT_SEC   = process.env.YOUTUBE_CLIENT_SECRET || '';
-const REFRESH_TOK  = process.env.TARGET_REFRESH_TOKEN  || '';
-const APP_URL      = process.env.APP_URL            || `http://localhost:${PORT}`;
-const SETUP_SEC    = process.env.SETUP_SECRET       || 'kingslayer_setup_2024';
+const PORT         = config.port;
+const SOURCE_CH    = config.sourceChannel;
+const TARGET_CH    = config.targetChannel;
+const API_KEY      = config.apiKey;
+const CLIENT_ID    = config.clientId;
+const CLIENT_SEC   = config.clientSecret;
+const REFRESH_TOK  = config.refreshToken;
+const APP_URL      = config.appUrl;
 const INTERVAL     = Math.max(1, parseInt(process.env.CHECK_INTERVAL_MINUTES) || 5);
-const TEMP         = '/tmp/ytr';
-const DB_PATH      = path.join(__dirname, 'data', 'state.json');
+const TEMP         = process.env.PROCESSING_TEMP_DIR || path.join(require('os').tmpdir(), 'ytr');
+const DB_PATH      = process.env.DB_PATH || path.join(__dirname, 'data', 'state.json');
 
 // ═══════════════════════════════════════════════════════════════════════
 //  DATABASE  (JSON file)
@@ -79,17 +81,27 @@ async function ytUpload({filePath, title, description}) {
   console.log(`[YT] Uploading: "${title}"`);
   const r = await yt.videos.insert({
     part:['snippet','status'],
-    requestBody:{ snippet:{title:clean(title),description:cleanD(description),categoryId:'22'}, status:{privacyStatus:process.env.UPLOAD_PRIVACY||'public',selfDeclaredMadeForKids:false} },
+    requestBody:{ snippet:{title:clean(title),description:cleanD(description),categoryId:'22'}, status:{privacyStatus:config.uploadPrivacy,selfDeclaredMadeForKids:false} },
     media:{ body: require('fs').createReadStream(filePath) },
   });
   console.log(`[YT] Uploaded → https://youtu.be/${r.data.id}`);
   return r.data;
 }
 
-function ytAuthUrl() {
-  return makeOAuth().generateAuthUrl({access_type:'offline',prompt:'consent',scope:['https://www.googleapis.com/auth/youtube.upload','https://www.googleapis.com/auth/youtube']});
+function ytAuthUrl({ state, challenge }) {
+  return makeOAuth().generateAuthUrl({ access_type: 'offline', prompt: 'consent', state,
+    code_challenge: challenge, code_challenge_method: 'S256',
+    scope: ['https://www.googleapis.com/auth/youtube.upload', 'https://www.googleapis.com/auth/youtube.readonly'] });
 }
-async function ytExchangeCode(code) { const {tokens} = await makeOAuth().getToken(code); return tokens; }
+async function ytExchangeCode(code, codeVerifier) {
+  const { tokens } = await makeOAuth().getToken({ code, codeVerifier });
+  const auth = makeOAuth();
+  auth.setCredentials(tokens);
+  const yt = google.youtube({ version: 'v3', auth });
+  const channels = await yt.channels.list({ part: ['id'], mine: true });
+  if (!channels.data.items?.some(channel => channel.id === TARGET_CH)) throw new Error('Target channel mismatch.');
+  return tokens;
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 //  FFMPEG PROCESSOR
@@ -234,9 +246,9 @@ async function runJob(video) {
     await dbDequeue(videoId);
     await dbAddJob({videoId,title,uploadedId:uploaded.id,status:'completed',completedAt:new Date().toISOString()});
   } catch(err){
-    push(`❌ ${err.message}`);
-    await setS('failed',{error:err.message});
-    await dbAddJob({videoId,title,status:'failed',error:err.message,failedAt:new Date().toISOString()});
+    push('❌ Video processing or upload failed.');
+    await setS('failed',{error:'Video processing or upload failed.'});
+    await dbAddJob({videoId,title,status:'failed',error:'Video processing or upload failed.',failedAt:new Date().toISOString()});
   } finally {
     if(dlPath)await fs.remove(dlPath).catch(()=>{});
     if(procPath)await fs.remove(procPath).catch(()=>{});
@@ -249,8 +261,15 @@ async function runJob(video) {
 // ═══════════════════════════════════════════════════════════════════════
 const app = express();
 app.set('strict routing', false);
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.disable('x-powered-by');
+app.use(securityHeaders(config));
+app.get('/healthz', (req, res) => res.json({ ok: true }));
+app.use(requireAdmin(config));
+app.use(requireSameOrigin(config));
+app.use(express.json({ limit: '16kb' }));
+app.use(express.urlencoded({ extended: false, limit: '16kb' }));
+const oauthState = createOAuthState(config);
+const asyncRoute = handler => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 
 // Strip trailing slashes
 app.use((req,res,next)=>{
@@ -272,7 +291,7 @@ async function pollAndQueue() {
     for(const v of videos){
       if(!(await dbIsProcessed(v.videoId))){
         const ok=await dbEnqueue(v);
-        if(ok){added++;runJob(v).catch(e=>console.error('[Poll]',e.message));}
+        if(ok){added++;runJob(v).catch(e=>console.error('[Poll] Operation failed.'));}
       }
     }
     await dbTouchPolled();
@@ -280,34 +299,31 @@ async function pollAndQueue() {
   } finally {polling=false;}
 }
 
-cron.schedule(`*/${INTERVAL} * * * *`,()=>{
-  if(!REFRESH_TOK||REFRESH_TOK==='PASTE_REFRESH_TOKEN_AFTER_SETUP'){console.log('[Cron] Skipping — token not set');return;}
-  console.log('[Cron] Polling...');
-  pollAndQueue().catch(e=>console.error('[Cron]',e.message));
-});
+
 
 // ── API Routes ────────────────────────────────────────────────────────────────
-app.get('/api/status', async(req,res)=>{
+app.get('/api/status', asyncRoute(async(req,res)=>{
   const [stats,queue,jobs]=await Promise.all([dbGetStats(),dbGetQueue(),dbGetJobs(20)]);
-  const tokenOk=!!(REFRESH_TOK && REFRESH_TOK!=='PASTE_REFRESH_TOKEN_AFTER_SETUP');
-  res.json({ok:true,tokenConfigured:tokenOk,sourceChannel:SOURCE_CH,targetChannel:TARGET_CH,stats,queue,jobs,
+  res.json({ok:true,tokenConfigured:!!REFRESH_TOK,sourceChannel:SOURCE_CH,targetChannel:TARGET_CH,stats,queue,jobs,
     activeJobs:Object.fromEntries(activeJobs),
     config:{intervalMins:INTERVAL,segments:process.env.CLIP_SEGMENTS||8,reverseChance:process.env.REVERSE_CLIP_CHANCE||0.4,pitchShift:process.env.AUDIO_PITCH_SHIFT||1,flip:process.env.ENABLE_HORIZONTAL_FLIP||'false',outputFormat:process.env.OUTPUT_FORMAT||'mp4'}});
-});
+}));
 
-app.post('/api/poll',async(req,res)=>{
-  try{res.json({ok:true,...(await pollAndQueue())});}
-  catch(e){res.status(500).json({ok:false,error:e.message});}
-});
+app.post('/api/poll',asyncRoute(async(req,res)=>{
+  if (!REFRESH_TOK) return res.status(409).json({ok:false,error:'Complete OAuth setup before polling.'});
+  res.json({ok:true,...(await pollAndQueue())});
+}));
 
-app.delete('/api/queue/:id',async(req,res)=>{await dbDequeue(req.params.id);res.json({ok:true});});
+app.delete('/api/queue/:id',asyncRoute(async(req,res)=>{
+  if (!/^[A-Za-z0-9_-]{11}$/.test(req.params.id)) return res.status(400).json({ok:false,error:'Invalid video ID.'});
+  await dbDequeue(req.params.id);res.json({ok:true});
+}));
 
 // ── OAuth Setup ───────────────────────────────────────────────────────────────
 app.get('/setup',(req,res)=>{
-  if(req.query.s!==SETUP_SEC) return res.status(403).send(`<body style="font:14px monospace;background:#111;color:#fff;padding:2rem"><h2>🔒 Wrong secret. Add ?s=${SETUP_SEC}</h2></body>`);
-  const tokenOk=!!(REFRESH_TOK&&REFRESH_TOK!=='PASTE_REFRESH_TOKEN_AFTER_SETUP');
-  const secretOk=!!(CLIENT_SEC&&CLIENT_SEC!=='YOUR_CLIENT_SECRET_HERE');
-  const authUrl=secretOk?ytAuthUrl():null;
+  const tokenOk=!!REFRESH_TOK;
+  const secretOk=!!CLIENT_SEC;
+  const authUrl='/auth/start';
   res.send(`<!DOCTYPE html><html><head><title>Setup</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Space Mono',monospace;background:#050508;color:#e8e8f0;padding:2rem}
@@ -322,7 +338,7 @@ code{background:#1a1a2e;padding:.2rem .5rem;border-radius:4px;font-size:.75rem;c
 .btn{display:inline-block;padding:.7rem 1.4rem;background:#5b3fff;color:#fff;text-decoration:none;border-radius:7px;font-family:'Space Mono',monospace;font-size:.78rem;margin-top:.5rem}
 p{font-size:.78rem;color:#888;line-height:1.7;margin-top:.4rem}ol{margin:.5rem 0 0 1.2rem;font-size:.78rem;color:#888;line-height:2.2}a{color:#00e5ff}</style></head><body>
 <h1>⚙️ YT Reposter Setup</h1>
-<p style="color:#888;font-size:.75rem;margin-top:.3rem">Source: ${SOURCE_CH} &rarr; Target: ${TARGET_CH}</p>
+<p style="color:#888;font-size:.75rem;margin-top:.3rem">Source: ${escapeHtml(SOURCE_CH)} &rarr; Target: ${escapeHtml(TARGET_CH)}</p>
 <h2>1. Status</h2>
 <div class="card">
   <div class="row"><label>YouTube API Key</label><span class="ok">✓ Set</span></div>
@@ -333,11 +349,11 @@ p{font-size:.78rem;color:#888;line-height:1.7;margin-top:.4rem}ol{margin:.5rem 0
 <h2>2. Add Redirect URI</h2>
 <div class="card">
   <p>In <a href="https://console.cloud.google.com/apis/credentials" target="_blank">Google Cloud Console</a> &rarr; OAuth 2.0 Client &rarr; add Authorized Redirect URI:</p>
-  <code style="display:block;margin-top:.5rem;padding:.75rem">${APP_URL}/auth/callback</code>
+  <code style="display:block;margin-top:.5rem;padding:.75rem">${escapeHtml(APP_URL)}/auth/callback</code>
 </div>
 <h2>3. Authorize Target Channel</h2>
 <div class="card">
-  <p>Sign in with the account that owns channel <code>${TARGET_CH}</code>.</p>
+  <p>Sign in with the account that owns channel <code>${escapeHtml(TARGET_CH)}</code>.</p>
   ${authUrl?`<a href="${authUrl}" class="btn">🔑 Authorize Target Channel &rarr;</a>`:'<p style="color:#ff8800">Add YOUTUBE_CLIENT_SECRET to Railway first, then reload.</p>'}
   ${tokenOk?'<p style="color:#00ff88;margin-top:.75rem">✅ Already authorized!</p>':''}
 </div>
@@ -345,10 +361,18 @@ p{font-size:.78rem;color:#888;line-height:1.7;margin-top:.4rem}ol{margin:.5rem 0
 </body></html>`);
 });
 
+app.get('/auth/start',(req,res)=>{
+  res.redirect(ytAuthUrl(oauthState.issue(res)));
+});
+
 app.get('/auth/callback',async(req,res)=>{
-  if(!req.query.code) return res.status(400).send('Missing code');
+  const codeVerifier = oauthState.consume(req, res);
+  if (!codeVerifier) return res.status(400).send('Invalid or expired authorization. Start setup again.');
+  if (req.query.error || typeof req.query.code !== 'string' || !req.query.code || req.query.code.length > 4096) {
+    return res.status(400).send('Authorization was not completed. Start setup again.');
+  }
   try {
-    const tokens=await ytExchangeCode(req.query.code);
+    const tokens=await ytExchangeCode(req.query.code, codeVerifier);
     res.send(`<!DOCTYPE html><html><head><title>Success</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Space Mono',monospace;background:#050508;color:#e8e8f0;padding:2rem}
@@ -357,7 +381,7 @@ h2{color:#00ff88;margin-bottom:1rem}code{display:block;word-break:break-all;back
 ol{margin:.75rem 0 0 1.2rem;line-height:2.4}a{color:#5b3fff;font-size:.8rem}</style></head><body>
 <h2>✅ Authorized Successfully!</h2>
 <p style="color:#888;font-size:.82rem;margin-bottom:.5rem">Copy your refresh token:</p>
-<code>${tokens.refresh_token||'No refresh token returned — re-run auth'}</code>
+<code>${escapeHtml(tokens.refresh_token||'No refresh token returned — re-run auth')}</code>
 <div class="warn"><strong>Next steps:</strong><ol>
 <li>Copy the token above</li>
 <li>Go to Railway &rarr; your project &rarr; Variables</li>
@@ -366,7 +390,7 @@ ol{margin:.75rem 0 0 1.2rem;line-height:2.4}a{color:#5b3fff;font-size:.8rem}</st
 </ol></div>
 <a href="/">← Dashboard</a>
 </body></html>`);
-  } catch(e){res.status(500).send(`<pre style="color:red;padding:2rem;background:#111">${e.message}</pre>`);}
+  } catch(e){res.status(500).send('Authorization failed. Check your OAuth configuration and target channel, then start setup again.');}
 });
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
@@ -374,7 +398,7 @@ app.get('/',(req,res)=>{
   res.send(`<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>YT Reposter — KingSlayer</title>
+<title>YT Reposter</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Bebas+Neue&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -456,7 +480,7 @@ background:linear-gradient(130deg,#fff 0%,var(--acc2) 55%,var(--acc) 100%);
 <div class="gbg"></div>
 <div class="wrap">
 <div class="hdr">
-  <div><div class="logo">YT REPOSTER</div><div class="tagline">@KingSlayer &middot; Auto-Upload &middot; Copyright Bypass</div></div>
+  <div><div class="logo">YT REPOSTER</div><div class="tagline">Video Processing &middot; Auto-Upload</div></div>
   <div class="hdr-r">
     <div id="sysPill" class="pill p-warn"><div class="dot"></div>Loading...</div>
     <div id="lastPoll" style="font-size:.57rem;color:var(--muted)">—</div>
@@ -464,13 +488,13 @@ background:linear-gradient(130deg,#fff 0%,var(--acc2) 55%,var(--acc) 100%);
 </div>
 <div id="setupBanner" class="banner" style="display:none">
   <p>⚠️ Target channel not authorized — uploads paused.</p>
-  <a href="/setup?s=${SETUP_SEC}">Complete Setup →</a>
+  <a href="/setup">Complete Setup →</a>
 </div>
 <div class="chbar">
   <span style="font-size:.57rem;color:var(--muted);text-transform:uppercase;letter-spacing:.18em">Flow</span>
-  <div class="chtag chsrc">▶ @kingslayeroffical <span style="opacity:.45;margin-left:.3rem">[SOURCE]</span></div>
+  <div class="chtag chsrc">▶ ${escapeHtml(SOURCE_CH)} <span style="opacity:.45;margin-left:.3rem">[SOURCE]</span></div>
   <span style="color:var(--muted);font-size:1.1rem">→ process →</span>
-  <div class="chtag chtgt">▶ ${TARGET_CH} <span style="opacity:.45;margin-left:.3rem">[TARGET]</span></div>
+  <div class="chtag chtgt">▶ ${escapeHtml(TARGET_CH)} <span style="opacity:.45;margin-left:.3rem">[TARGET]</span></div>
   <span style="margin-left:auto;font-size:.6rem;color:var(--muted)">auto-poll every ${INTERVAL}m</span>
 </div>
 <div class="stats">
@@ -480,9 +504,9 @@ background:linear-gradient(130deg,#fff 0%,var(--acc2) 55%,var(--acc) 100%);
   <div class="stat" style="--lc:var(--red)"><div class="slbl">Failed</div><div class="sval" id="sFail" style="color:var(--red)">0</div></div>
 </div>
 <div class="ctrl">
-  <button class="btn bpri" onclick="pollNow()" id="btnPoll">⟳ Poll Channel Now</button>
-  <button class="btn bsec" onclick="load()" id="btnRefresh">↻ Refresh</button>
-  <a href="/setup?s=${SETUP_SEC}" class="btn bwarn">⚙ Setup</a>
+  <button class="btn bpri" id="btnPoll">⟳ Poll Channel Now</button>
+  <button class="btn bsec" id="btnRefresh">↻ Refresh</button>
+  <a href="/setup" class="btn bwarn">⚙ Setup</a>
 </div>
 <div class="mods">
   <div class="mlbl">Active Modifications</div>
@@ -505,10 +529,11 @@ background:linear-gradient(130deg,#fff 0%,var(--acc2) 55%,var(--acc) 100%);
 <div class="footer">YT REPOSTER &middot; RAILWAY &middot; POLLS EVERY ${INTERVAL} MINUTES</div>
 </div>
 <div id="toast"></div>
-<script>
+<script nonce="${res.locals.cspNonce}">
+const esc = ${escapeHtml.toString()};
 function toast(m,c){const e=document.getElementById('toast');e.textContent=m;e.style.borderColor=c||'rgba(80,80,160,.5)';e.classList.add('show');clearTimeout(e._t);e._t=setTimeout(()=>e.classList.remove('show'),3000)}
-function stag(s){return '<span class="stag s-'+s+'">'+s+'</span>'}
-function pbar(p,l){return '<div class="pbar"><div class="pfill'+(l?' live':'')+'" style="width:'+p+'%"></div></div>'}
+function stag(s){return '<span class="stag s-'+esc(s)+'">'+esc(s)+'</span>'}
+function pbar(p,l){p=Math.max(0,Math.min(100,Number(p)||0));return '<div class="pbar"><div class="pfill'+(l?' live':'')+'" style="width:'+p+'%"></div></div>'}
 async function load(){
   const btn=document.getElementById('btnRefresh');btn.innerHTML='<span class="spin"></span>';btn.disabled=true;
   try{const d=await(await fetch('/api/status')).json();render(d);}
@@ -530,26 +555,41 @@ function render(d){
   const qEl=document.getElementById('qList');
   if(!q.length){qEl.innerHTML='<div class="empty"><div class="eico">📭</div>Queue empty — poll to check</div>';}
   else qEl.innerHTML=q.map(v=>{const aj=act[v.videoId];const pct=aj?.percent??0;const live=['downloading','processing','uploading'].includes(v.status)&&aj;const log=aj?.log?.slice(-1)[0]||'';
-    return '<div class="item"><div class="ititle">'+(v.title||v.videoId)+'</div><div class="imeta"><span class="vid">'+v.videoId+'</span>'+stag(v.status)+'</div>'+(log?'<div class="ilog">'+log+'</div>':'')+(v.error?'<div class="ierr">'+v.error.slice(0,80)+'</div>':'')+(live?pbar(pct,true):v.status==='completed'?pbar(100,false):'')+'</div>';}).join('');
+    return '<div class="item"><div class="ititle">'+esc(v.title||v.videoId)+'</div><div class="imeta"><span class="vid">'+esc(v.videoId)+'</span>'+stag(v.status)+'</div>'+(log?'<div class="ilog">'+esc(log)+'</div>':'')+(v.error?'<div class="ierr">'+esc(v.error.slice(0,80))+'</div>':'')+(live?pbar(pct,true):v.status==='completed'?pbar(100,false):'')+'</div>';}).join('');
   const jobs=d.jobs||[];
   document.getElementById('jBadge').textContent=jobs.length;
   const jEl=document.getElementById('jList');
   if(!jobs.length){jEl.innerHTML='<div class="empty"><div class="eico">📋</div>No jobs yet</div>';}
-  else jEl.innerHTML=jobs.map(j=>'<div class="item"><div class="ititle">'+(j.title||j.videoId)+'</div><div class="imeta"><span class="vid">'+j.videoId+'</span>'+(j.uploadedId?'<a href="https://youtu.be/'+j.uploadedId+'" target="_blank" style="font-size:.57rem;color:var(--acc2)">→ youtu.be/'+j.uploadedId+'</a>':'')+stag(j.status)+'</div>'+(j.error?'<div class="ierr">'+j.error.slice(0,80)+'</div>':'')+(j.status==='completed'?pbar(100,false):'')+'</div>').join('');
-  if(d.config)document.getElementById('modTags').innerHTML=['✂ '+d.config.segments+' Segs','🔀 Shuffle','⏪ Rev '+(d.config.reverseChance*100).toFixed(0)+'%','⚡ ±3% Speed','🎵 Pitch +'+d.config.pitchShift+'st','🎨 Color','🔧 Noise','✂ Crop','📦 H.264'].map(t=>'<span class="mtag">'+t+'</span>').join('');
+  else jEl.innerHTML=jobs.map(j=>'<div class="item"><div class="ititle">'+esc(j.title||j.videoId)+'</div><div class="imeta"><span class="vid">'+esc(j.videoId)+'</span>'+(/^[A-Za-z0-9_-]{11}$/.test(j.uploadedId||'')?'<a href="https://youtu.be/'+esc(j.uploadedId)+'" target="_blank" style="font-size:.57rem;color:var(--acc2)">→ youtu.be/'+j.uploadedId+'</a>':'')+stag(j.status)+'</div>'+(j.error?'<div class="ierr">'+esc(j.error.slice(0,80))+'</div>':'')+(j.status==='completed'?pbar(100,false):'')+'</div>').join('');
+  if(d.config)document.getElementById('modTags').innerHTML=['✂ '+d.config.segments+' Segs','🔀 Shuffle','⏪ Rev '+(d.config.reverseChance*100).toFixed(0)+'%','⚡ ±3% Speed','🎵 Pitch +'+d.config.pitchShift+'st','🎨 Color','🔧 Noise','✂ Crop','📦 H.264'].map(t=>'<span class="mtag">'+esc(t)+'</span>').join('');
 }
 async function pollNow(){
   const btn=document.getElementById('btnPoll');btn.innerHTML='<span class="spin"></span> Polling...';btn.disabled=true;
-  try{const d=await(await fetch('/api/poll',{method:'POST'})).json();toast(d.newVideos>0?'✅ '+d.newVideos+' new video(s)!':'✓ No new videos',d.newVideos>0?'var(--green)':undefined);setTimeout(load,1500);}
+  try{const response=await fetch('/api/poll',{method:'POST',headers:{'X-Requested-With':'YTReposter'}});const d=await response.json();if(!response.ok)throw new Error(d.error||'Polling failed');toast(d.newVideos>0?'✅ '+d.newVideos+' new video(s)!':'✓ No new videos',d.newVideos>0?'var(--green)':undefined);setTimeout(load,1500);}
   catch(e){toast('Error: '+e.message,'var(--red)');}
   finally{btn.innerHTML='⟳ Poll Channel Now';btn.disabled=false;}
 }
+document.getElementById('btnPoll').addEventListener('click',pollNow);
+document.getElementById('btnRefresh').addEventListener('click',load);
 load();setInterval(load,12000);
 </script></body></html>`);
 });
 
-app.listen(PORT,()=>{
-  console.log(`\n✅ YT Reposter running on port ${PORT}`);
-  console.log(`   Dashboard: http://localhost:${PORT}`);
-  console.log(`   Setup:     http://localhost:${PORT}/setup?s=${SETUP_SEC}\n`);
+app.use((err,req,res,next)=>{
+  console.error('[Server] Request failed.');
+  if (res.headersSent) return next(err);
+  res.status(err.status >= 400 && err.status < 500 ? err.status : 500)
+    .json({ok:false,error:'Request failed. Check server configuration and provider status.'});
 });
+
+if (require.main === module) {
+  cron.schedule(`*/${INTERVAL} * * * *`,()=>{
+    if (!REFRESH_TOK) return;
+    pollAndQueue().catch(()=>console.error('[Cron] Polling failed.'));
+  });
+  app.listen(PORT,()=>{
+    console.log(`YT Reposter running on port ${PORT}. Admin login required.`);
+  });
+}
+
+module.exports = { app };
